@@ -1,0 +1,38 @@
+{
+  "server": {
+    "host": "your-server-address.example.com",
+    "tcp_port": 10333,
+    "udp_port": 10333,
+    "username": "AI_Bot",
+    "password": "YOUR_BOT_PASSWORD",
+    "nickname": "🤖 AI Bot",
+    "encrypted": false
+  },
+  "ai": {
+    "provider": "gemini",
+    "api_key": "YOUR_GEMINI_API_KEY",
+    "model": "gemini-flash-latest",
+    "system_prompt": "You are a helpful, friendly AI assistant in a TeamTalk 5 voice chat room. Respond in Arabic when users write in Arabic, and in English when they write in English. Keep responses concise and helpful.",
+    "max_tokens": 200,
+    "temperature": 0.7
+  },
+  "commands": {
+    "prefix": "!",
+    "enabled": true
+  },
+  "moderation": {
+    "anti_spam": {
+      "enabled": true,
+      "repeat_count": 3,
+      "repeat_window": 60,
+      "flood_count": 5,
+      "flood_seconds": 10,
+      "warn_cooldown": 5,
+      "max_warnings": 3,
+      "auto_mute": true
+    }
+  },
+  "admins": [
+    "your-nickname-here"
+  ]
+}
