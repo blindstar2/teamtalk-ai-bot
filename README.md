@@ -9,6 +9,13 @@ A conversational AI bot for **TeamTalk 5** voice chat servers. The bot joins you
 
 > **Status: v1.0 Beta** — feature-complete and in daily use, but still being tested. Please report any issues you find!
 
+## ⬇️ Download
+
+No git needed — grab the ready-to-use zip:
+**[teamtalk-ai-bot-v1.0-beta.zip](https://github.com/blindstar2/teamtalk-ai-bot/releases/download/v1.0-beta/teamtalk-ai-bot-v1.0-beta.zip)**
+
+Unzip it, copy `config.example.json` to `config.txt`, add your server details and API key, and run `run.bat` (Windows) or `python bot.py`.
+
 ## How Messaging Works
 
 > [!IMPORTANT]
