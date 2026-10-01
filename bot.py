@@ -9,6 +9,7 @@ TypeError: 'NoneType' object can't be awaited
 
 import json
 import os
+import re
 import sys
 import time
 import threading
@@ -36,6 +37,7 @@ from ai_engine import AIEngine
 from yt_helper import search_youtube, get_video_info
 from stats_store import store
 from moderation import Moderation
+from prizes import Prizes, MOD_LITE_RIGHTS, BASIC_RIGHTS
 
 # Users the bot currently ignores (nickname lower-case -> reason)
 muted_users = {}
@@ -74,6 +76,292 @@ def apply_unmute(tt, nick, by=''):
                 tt.subscribe(tt.get_user(uid), sub)
     except Exception:
         pass
+
+
+# ============================================================
+#  PRIZE GRANT HELPERS  (never grant admin - hard rule)
+# ============================================================
+
+def _build_account(usertype, rights_names):
+    acc = sdk.UserAccount()
+    acc.uUserType = usertype
+    rights = 0
+    for name in rights_names:
+        rights |= int(getattr(sdk.UserRight, name, 0) or 0)
+    acc.uUserRights = rights
+    return acc
+
+
+def grant_account_prize(nick, username, password):
+    """Create a normal (never admin) user account on the server."""
+    tt = bot.teamtalks[0]
+    acc = _build_account(sdk.UserType.USERTYPE_DEFAULT, BASIC_RIGHTS)
+    acc.szUsername = sdk.ttstr(username)
+    acc.szPassword = sdk.ttstr(password)
+    result = sdk._DoNewUserAccount(tt._tt, acc)
+    if result == -1:
+        raise ValueError('Server rejected the account (maybe already exists)')
+    return True
+
+
+def grant_modpowers_account(username, password):
+    """Create/upgrade an account with moderator-lite rights (never admin)."""
+    tt = bot.teamtalks[0]
+    acc = _build_account(sdk.UserType.USERTYPE_DEFAULT, MOD_LITE_RIGHTS)
+    acc.szUsername = sdk.ttstr(username)
+    acc.szPassword = sdk.ttstr(password)
+    result = sdk._DoNewUserAccount(tt._tt, acc)
+    if result == -1:
+        raise ValueError('Server rejected the account (maybe already exists)')
+    return True
+
+
+def grant_channel_prize(nick):
+    """Create a permanent channel named after the user; bot keeps op rights."""
+    tt = bot.teamtalks[0]
+    base = tt.super.getMyChannelID()
+    safe = re.sub(r'[^\w\- ]', '', str(nick)).strip()[:30] or ('Home of ' + str(nick))[:30]
+    name = safe
+    n = 2
+    existing = set()
+    try:
+        for c in tt.super.getServerChannels():
+            existing.add(str(getattr(c, 'szName', '') or '').lower())
+    except Exception:
+        pass
+    while name.lower() in existing and n < 20:
+        name = safe + ' ' + str(n)
+        n += 1
+    tt.create_channel(name, base, topic='Prize channel of ' + str(nick))
+    chan_id = None
+    try:
+        for c in tt.super.getServerChannels():
+            if str(getattr(c, 'szName', '') or '').lower() == name.lower():
+                chan_id = int(getattr(c, 'nChannelID', 0) or 0)
+                break
+    except Exception:
+    	
+        pass
+    prizes.record_channel(nick, name, chan_id)
+    return name, chan_id
+
+
+def grant_channel_op(nick, channel_id, by='prize system'):
+    tt = bot.teamtalks[0]
+    target = find_user_by_name(tt, nick)
+    if target is None:
+        return False, 'not online'
+    uid = int(getattr(target, 'nUserID', 0) or 0)
+    tt.make_channel_operator(tt.get_user(uid), channel_id)
+    return True, 'ok'
+
+
+def handle_prize_command(cmd, args, message, sender, user_id):
+    prefix = config['commands']['prefix']
+
+    if cmd == 'daily':
+        ok, streak, prize, _msg = prizes.claim_status(sender)
+        if not ok:
+            send_reply(message, '📅 You already claimed today, ' + sender + '! Streak: ' + str(streak)
+                       + ' day(s). Come back tomorrow!')
+            return
+        streak, prize, flags = prizes.do_claim(sender)
+        store.count_message(user_id, sender)
+        msg = '🎉 Day ' + str(streak) + ' claimed!'
+        # Activity bonus: very active + regular claimers get channel-op once
+        try:
+            total_msgs = store.data['users'].get(store.user_key(user_id), {}).get('messages', 0)
+            if prizes.should_activity_promote(sender, total_msgs):
+                tt0 = bot.teamtalks[0]
+                target = find_user_by_name(tt0, sender)
+                if target is not None:
+                    chan_now = int(getattr(target, 'nChannelID', 0) or 0)
+                    if chan_now and prizes.record_activity_op(sender, chan_now):
+                        tt0.make_channel_operator(tt0.get_user(int(getattr(target, 'nUserID', 0) or 0)), chan_now)
+                        msg += '\n⭐ ACTIVITY BONUS: you are now channel operator here! Keep being awesome.'
+        except Exception:
+            pass
+        if prize == 'account':
+            u = prizes._user(sender)
+            if u.get('accounts'):
+                msg += '\n🎫 You already have an account - this day adds nothing new.'
+            else:
+                prizes.pending_account(sender, True)
+                msg += ('\n🎫 You won a REGISTERED USER ACCOUNT!\n'
+                        'Pick a username + password and send:\n'
+                        + prefix + 'claimacc [username] [password]\n'
+                        '(PM the bot for privacy!)')
+        elif prize == 'channel':
+            try:
+                name, chan_id = grant_channel_prize(sender)
+                msg += '\n📺 Your own channel is ready: "' + name + '"'
+                if chan_id:
+                    ok2, why = grant_channel_op(sender, chan_id)
+                    if ok2:
+                        msg += '\n⭐ You are now channel operator there!'
+                    else:
+                        msg += '\n(Join the server, then type ' + prefix + 'opme to get operator)'
+            except Exception as e:
+                msg += '\n⚠️ Channel creation failed (bot needs permission): ' + str(e)
+        elif prize == 'modpowers':
+            if flags.get('modpowers_first'):
+                prizes.record_modpowers_pending(sender)
+                msg += ('\n🛡️ MODERATOR-LITE UNLOCKED! Send (in PM!):\n'
+                        + prefix + 'modacc [username] [password]\n'
+                        'This creates an account with: move users + kick from channels.\n'
+                        'It can NEVER ban, never manage accounts, never be admin.')
+            else:
+                msg += '\n🛡️ You already have moderator-lite powers (repeat prize).'
+        else:
+            if flags.get('loyal_first'):
+                prizes.record_loyal(sender)
+                msg += '\n🔥 LOYAL MEMBER status unlocked!'
+            msg += '\n🔥 Loyalty perks: ' + str(streak) + '-day streak. Keep it alive!'
+        send_reply(message, msg)
+        return
+
+    if cmd == 'claimacc':
+        parts = args.split()
+        if len(parts) != 2:
+            send_reply(message, 'Send it like: ' + prefix + 'claimacc [username] [password]  (best in PM)')
+            return
+        u = prizes._user(sender)
+        if not u.get('pending_account'):
+            send_reply(message, 'You have no account prize waiting. Claim ' + prefix + 'daily first!')
+            return
+        username, password = parts
+        if not prizes.USERNAME_RE.match(username):
+            send_reply(message, 'Username: 3-20 letters/numbers/_/. only. Try again.')
+            return
+        if len(password) < 4:
+            send_reply(message, 'Password must be at least 4 characters. Try again.')
+            return
+        try:
+            grant_account_prize(sender, username, password)
+        except Exception as e:
+            send_reply(message, '❌ Account creation failed: ' + str(e))
+            return
+        prizes.record_account(sender, username)
+        send_reply(message, '✅ Account "' + username + '" created! Log in with it next time you connect.')
+        return
+
+    if cmd == 'modacc':
+        parts = args.split()
+        if len(parts) != 2:
+            send_reply(message, 'Send it like: ' + prefix + 'modacc [username] [password]  (PM only!)')
+            return
+        u = prizes._user(sender)
+        if not u.get('modpowers_pending'):
+            reach = prizes.ladder.get(3)
+            send_reply(message, 'No moderator prize waiting. Reach day 3 of the ' + prefix + 'daily ladder first!')
+            return
+        username, password = parts
+        if not prizes.USERNAME_RE.match(username):
+            send_reply(message, 'Username: 3-20 letters/numbers/_/. only. Try again.')
+            return
+        if len(password) < 4:
+            send_reply(message, 'Password must be at least 4 characters. Try again.')
+            return
+        try:
+            grant_modpowers_account(username, password)
+        except Exception as e:
+            send_reply(message, '❌ Account creation failed: ' + str(e))
+            return
+        prizes.record_modpowers(sender, username)
+        send_reply(message, '✅ Moderator-lite account "' + username + '" is ready! Rights: move users, kick from channels, be channel op. NEVER admin.')
+        return
+
+    if cmd == 'opme':
+        u = prizes._user(sender)
+        chans = u.get('channels') or []
+        if not chans:
+            won = prizes.ladder.get(2)
+            send_reply(message, 'You need to win a channel first (day 2 of the ladder: ' + str(won) + ')')
+            return
+        try:
+            tt = bot.teamtalks[0]
+            target = find_user_by_name(tt, sender)
+            if target is None:
+                send_reply(message, 'Join the server first, then send ' + prefix + 'opme.')
+                return
+            uid = int(getattr(target, 'nUserID', 0) or 0)
+            my_chan = int(getattr(target, 'nChannelID', 0) or 0)
+            ok = False
+            for c in chans:
+                if c.get('channel_id') == my_chan:
+                    ok = True
+                    break
+            if not ok:
+                send_reply(message, 'Join your own channel first, then send ' + prefix + 'opme.')
+                return
+            tt.make_channel_operator(tt.get_user(uid), my_chan)
+            send_reply(message, '⭐ You are now operator of your channel!')
+        except Exception as e:
+            send_reply(message, 'Failed to make you operator: ' + str(e))
+        return
+
+    if cmd == 'prizes':
+        send_reply(message, prizes.ladder_text(sender))
+        return
+
+    if cmd == 'mystuff':
+        send_reply(message, prizes.mystuff_text(sender))
+        return
+
+    if cmd == 'streaks':
+        rows = prizes.top_streaks(5)
+        if not rows:
+            send_reply(message, 'No claims yet - be the first! Type ' + prefix + 'daily!')
+            return
+        medals = ['🥇', '🥈', '🥉', '4.', '5.']
+        lines = ['🔥 BEST STREAKS']
+        for i, (name, best, total) in enumerate(rows):
+            lines.append(medals[i] + ' ' + name + ' - ' + str(best) + ' day streak | ' + str(total) + ' claims')
+        send_reply(message, '\n'.join(lines))
+        return
+
+    if cmd == 'giveprize':
+        if not is_admin_user(user_id, sender):
+            send_reply(message, '⛔ Admin only.')
+            return
+        parts = args.split(None, 1)
+        if len(parts) < 1 or not parts[0]:
+            send_reply(message, 'Usage: ' + prefix + 'giveprize [nickname] [account|channel|modpowers|loyal]')
+            return
+        who = parts[0]
+        what = parts[1].strip().lower() if len(parts) > 1 else ''
+        if what == 'account':
+            prizes.pending_account(who, True)
+            send_reply(message, '🎫 ' + who + ' can now create an account with ' + prefix + 'claimacc (they must be online to receive this).')
+        elif what == 'channel':
+            try:
+                name, cid = grant_channel_prize(who)
+                send_reply(message, '📺 Channel "' + name + '" created for ' + who + '.')
+            except Exception as e:
+                send_reply(message, 'Failed: ' + str(e))
+        elif what == 'modpowers':
+            prizes.record_modpowers_pending(who)
+            send_reply(message, '🛡️ ' + who + ' can now create a moderator-lite account with ' + prefix + 'modacc.')
+        elif what == 'loyal':
+            prizes.record_loyal(who)
+            send_reply(message, '🔥 ' + who + ' is now a loyal member!')
+        else:
+            send_reply(message, 'Unknown prize. Options: account, channel, modpowers, loyal')
+        return
+
+    if cmd == 'resetdaily':
+        if not is_admin_user(user_id, sender):
+            send_reply(message, '⛔ Admin only.')
+            return
+        who = args.strip()
+        if not who:
+            send_reply(message, 'Usage: ' + prefix + 'resetdaily [nickname]')
+            return
+        u = prizes._user(who)
+        u['last_claim'] = None
+        prizes.save()
+        send_reply(message, '🔄 ' + who + ' can claim ' + prefix + 'daily again.')
+        return
 
 
 def warn_user(nick, reason, by, message=None):
@@ -129,6 +417,7 @@ if api_key_env and os.environ.get(api_key_env):
     ai_config['api_key'] = os.environ[api_key_env]
 mod_config = config.get('moderation', {})
 moderation = Moderation(mod_config.get('anti_spam', {}))
+prizes = Prizes(config.get('prizes', {}))
 # Bot admins: nicknames/usernames listed in config ("admins": ["name", ...]).
 # TeamTalk server admins are also trusted automatically.
 admins = [str(a).lower() for a in config.get('admins', [])]
@@ -158,17 +447,36 @@ def is_rate_limited(user_id):
 
 
 def get_sender_name(message):
+    """Resolve the sender's nickname, falling back to username, then User_<id>.
+
+    NOTE: message.user is a TeamTalkUser wrapper. Friendly attribute names
+    ('nickname', 'username') resolve through the wrapper; raw SDK names like
+    'szNickname' do NOT (the wrapper's lookup re-cases them), so always use
+    the friendly names here.
+    """
     try:
         user = message.user
-        nick = getattr(user, 'szNickname', None)
+        nick = getattr(user, 'nickname', None)
         if nick:
             return str(nick)
-        uname = getattr(user, 'szUsername', None)
+        uname = getattr(user, 'username', None)
         if uname:
             return str(uname)
-        return 'User_' + str(message.from_id)
     except Exception:
-        return 'Unknown'
+        pass
+    # Fallback: raw user struct straight from the SDK (works even if the
+    # wrapper failed to build, e.g. the sender left the server meanwhile).
+    try:
+        raw = bot.teamtalks[0].super.getUser(int(message.from_id))
+        nick = str(getattr(raw, 'szNickname', '') or '')
+        if nick:
+            return nick
+        uname = str(getattr(raw, 'szUsername', '') or '')
+        if uname:
+            return uname
+    except Exception:
+        pass
+    return 'User_' + str(message.from_id)
 
 
 def is_pm(message):
@@ -424,6 +732,14 @@ async def on_ready():
     print('  Anti-spam: ' + ('ON (warn after ' + str(moderation.repeat_count) + ' repeats / ' + str(moderation.flood_count) + '+ msgs, mute at ' + str(moderation.max_warnings) + ' warnings)' if moderation.enabled else 'OFF'))
     print('=' * 50)
 
+    # Make sure the bot shows the configured nickname (not the login username)
+    try:
+        nick = s.get('nickname') or '🤖 AI Bot'
+        for tt in bot.teamtalks:
+            tt.change_nickname(nick)
+    except Exception:
+        pass
+
     # Re-apply persisted mutes after reconnect (subscriptions are lost on restart)
     try:
         tt = bot.teamtalks[0]
@@ -442,8 +758,9 @@ async def on_ready():
 async def on_user_join(user, channel):
     """Welcome message when someone joins."""
     try:
-        name = getattr(user, 'szNickname', None) or getattr(user, 'szUsername', None) or 'Someone'
-        user_id = getattr(user, 'nUserID', None)
+        # user is a TeamTalkUser wrapper: use friendly names ('nickname', 'id')
+        name = getattr(user, 'nickname', None) or getattr(user, 'username', None) or 'Someone'
+        user_id = getattr(user, 'id', None)
         print('[JOIN] ' + str(name) + ' joined')
 
         # Skip welcoming ourselves
@@ -543,6 +860,11 @@ async def on_message(message):
             send_reply(message, '\n'.join(lines))
             return
 
+        # ---------- prize system ----------
+        if cmd in ('daily', 'claimacc', 'modacc', 'opme', 'prizes', 'mystuff', 'streaks', 'giveprize', 'resetdaily'):
+            handle_prize_command(cmd, args, message, sender, user_id)
+            return
+
         # ---------- warnings (users can check their own) ----------
         if cmd == 'warnings':
             if args:
@@ -573,8 +895,9 @@ async def on_message(message):
             return
 
         if cmd == 'help':
-            send_reply(message, 'Commands: !help !stats !statsall !top !about !time !ping !ask [q] !joke !translate [text] !poll [q] | [opt1] | [opt2] ... !vote [n] !yt [search] !ytinfo [link] !warnings')
-            send_reply(message, 'Admin: !kick !kickc !ban !mute !unmute !warn [name] [reason] !warnings [name] !clearwarnings [name] !move [name] [channel] !channels !announce [text] !shutdown')
+            send_reply(message, 'Commands: !help !daily !prizes !mystuff !streaks !opme !stats !statsall !top !about !time !ping !ask [q] !joke !translate [text] !poll [q] | [opt1] | [opt2] ... !vote [n] !yt [search] !ytinfo [link] !warnings')
+            send_reply(message, 'Prizes: claim with !daily every day - day 1 account, day 2 own channel, day 3 moderator-lite powers (never admin), day 7+ loyal perks')
+            send_reply(message, 'Admin: !kick !kickc !ban !mute !unmute !warn [name] [reason] !warnings [name] !clearwarnings [name] !move [name] [channel] !channels !announce [text] !giveprize [name] [prize] !resetdaily [name] !shutdown')
             return
         if cmd == 'about':
             msg = 'AI Bot v1.1 | Provider: ' + ai_config['provider'].title() + ' | Model: ' + ai_config['model']
@@ -767,7 +1090,8 @@ def main():
                 'tcp_port': s['tcp_port'],
                 'udp_port': s['udp_port'],
                 'username': s['username'],
-                'password': s['password']
+                'password': s['password'],
+                'nickname': s.get('nickname') or '🤖 AI Bot'
             })
             await bot._start()
 

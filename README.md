@@ -170,6 +170,7 @@ teamtalk-ai-bot/
 ├── ai_engine.py      # AI providers, fallback chain, per-user memory
 ├── stats_store.py    # Persistent statistics (stats.json)
 ├── moderation.py     # Anti-spam, warnings, mutes (warnings.json)
+├── prizes.py         # Daily prize ladder: !daily, !claimacc, !opme, !modacc
 ├── yt_helper.py      # YouTube search & video info
 ├── config.example.json  # Template — copy to config.txt and fill in
 ├── run.bat / setup.bat       # Windows launcher / installer
